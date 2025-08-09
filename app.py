@@ -689,5 +689,4 @@ if __name__ == "__main__":
     main_app()
 '''
 
-APP_PATH.write_text(code, encoding="utf-8")
 APP_PATH.as_posix()
