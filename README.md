@@ -1,0 +1,1 @@
+selamun aleyküm dünya
