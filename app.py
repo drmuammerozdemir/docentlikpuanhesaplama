@@ -1,602 +1,693 @@
-# -*- coding: utf-8 -*-
-"""
-Doçentlik Puan Hesaplayıcı (Sağlık Bilimleri – TABLO 10 / 2025)
-----------------------------------------------------------------
-Bu Streamlit uygulaması, ÜAK 2025 "Tablo 10. Sağlık Bilimleri Temel Alanı" kurallarını
-esas alarak puan hesaplaması yapar. (Kural özeti kod içinde sabit olarak tanımlıdır.)
+# Create a complete Streamlit app with:
+# - User login/registration (SQLite + salted SHA256)
+# - Visit counter
+# - Full Tablo 10 (2025 Sağlık Bilimleri) point calculator with all modules
+# - Record save/load per user
+# - Admin panel to view/export all users and records
+# The app is a single file: /mnt/data/docentlik_puan_app.py
 
-Özellikler:
-- Kullanıcı girişi (kayıt/oturum açma) – sqlite + PBKDF2 ile parola hash
-- Ziyaret sayaç (site-wide)
-- Yayın/etkinlik kayıtlarını kullanıcı bazında kaydetme (sqlite)
-- Uluslararası Makale (Madde 1), Ulusal Makale (Madde 2), Lisansüstü Tezden Üretilmiş Yayın (Madde 3)
-  için puan motoru (yazar payı kuralları dâhil)
-- Madde 3 üst sınırları (max 20 puan; g-h toplam max 5) uygulanır
-- Basit uygunluk denetimleri (minimum şartlara dair özet rapor)
-- Excel/CSV dışa aktarma
+import os, json, sqlite3, hashlib, time, textwrap, datetime as dt
+from pathlib import Path
 
-Notlar:
-- Bu araç ÜAK'ın resmi yazılımı değildir. Resmi metin: "2025 doçentlik başvuru şartları.pdf"
-- Geliştirme için: `pip install streamlit`
-- Çalıştırma: `streamlit run docentlik_puan_app.py`
-"""
+APP_PATH = Path("/mnt/data/docentlik_puan_app.py")
 
+code = r'''
 import os
-import io
 import json
-import math
-import hashlib
+import time
 import sqlite3
+import hashlib
+import datetime as dt
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Any
+from typing import Dict, Any, Tuple, List
 
-import pandas as pd
 import streamlit as st
 
-###########################
-# Config & DB
-###########################
-APP_TITLE = "Doçentlik Puan Hesaplayıcı – Sağlık Bilimleri (2025)"
-DB_PATH = os.environ.get("DOCENTLIK_DB", "docentlik_app.db")
-HASH_ITER = 200_000
+# =========================
+# Config
+# =========================
+DB_PATH = os.environ.get("DOCENT_DB_PATH", "docentlik.db")
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")  # change in production!
 
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
+APP_TITLE = "Doçentlik Puan Hesaplayıcı — Sağlık Bilimleri (2025)"
+APP_FOOTER = "© 2025 — Örnek Uygulama (Tablo 10 - Sağlık Bilimleri). Lütfen resmi tablolarla doğrulayın."
 
-@st.cache_resource
+# =========================
+# Helpers
+# =========================
+def sha256_hash(password: str, salt: str) -> str:
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.row_factory = sqlite3.Row
     return conn
 
-conn = get_conn()
-
-###########################
-# DB Schema
-###########################
-conn.execute(
-    """
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT,
-        salt BLOB NOT NULL,
-        pwd_hash BLOB NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """
-)
-
-conn.execute(
-    """
-    CREATE TABLE IF NOT EXISTS records (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        category TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    """
-)
-
-conn.execute(
-    """
-    CREATE TABLE IF NOT EXISTS site_counter (
-        id INTEGER PRIMARY KEY CHECK (id=1),
-        visits INTEGER NOT NULL
-    );
-    """
-)
-
-# init counter row
-cur = conn.execute("SELECT visits FROM site_counter WHERE id=1")
-row = cur.fetchone()
-if row is None:
-    conn.execute("INSERT INTO site_counter (id, visits) VALUES (1, 0)")
-    conn.commit()
-
-# increment counter once per session
-if "_counter_incremented" not in st.session_state:
-    conn.execute("UPDATE site_counter SET visits = visits + 1 WHERE id=1")
-    conn.commit()
-    st.session_state["_counter_incremented"] = True
-
-visits = conn.execute("SELECT visits FROM site_counter WHERE id=1").fetchone()[0]
-st.caption(f"Toplam ziyaret: {visits}")
-
-###########################
-# Auth Helpers
-###########################
-def hash_password(password: str, salt: Optional[bytes] = None):
-    if salt is None:
-        salt = os.urandom(16)
-    pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, HASH_ITER)
-    return salt, pwd_hash
-
-def register_user(username: str, email: str, password: str) -> Optional[str]:
-    try:
-        salt, pwd_hash = hash_password(password)
-        conn.execute(
-            "INSERT INTO users (username, email, salt, pwd_hash) VALUES (?, ?, ?, ?)",
-            (username, email, salt, pwd_hash),
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
         )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            total REAL NOT NULL,
+            breakdown TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stats (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        )
+    """)
+    # visit counter
+    cur.execute("INSERT OR IGNORE INTO stats(key, value) VALUES ('visits', 0)")
+    conn.commit()
+
+    # bootstrap admin if not exists
+    cur.execute("SELECT * FROM users WHERE username=?", (ADMIN_USER,))
+    if cur.fetchone() is None:
+        salt = os.urandom(16).hex()
+        ph = sha256_hash(ADMIN_PASS, salt)
+        cur.execute("""INSERT INTO users(username, password_hash, salt, is_admin, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (ADMIN_USER, ph, salt, 1, dt.datetime.utcnow().isoformat()))
         conn.commit()
-        return None
-    except sqlite3.IntegrityError as e:
-        return "Kullanıcı adı zaten mevcut."
+    conn.close()
 
-def verify_user(username: str, password: str) -> Optional[int]:
-    cur = conn.execute("SELECT id, salt, pwd_hash FROM users WHERE username=?", (username,))
-    row = cur.fetchone()
-    if not row:
-        return None
-    uid, salt, pwd_hash = row
-    test_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, HASH_ITER)
-    if test_hash == pwd_hash:
-        return uid
-    return None
-
-###########################
-# Rule Engine (TABLO 10)
-###########################
-# Author share rule:
-# - 1 author -> full
-# - 2 authors -> major: 0.8*full, second: 0.5*full
-# - 3+ authors -> major: 0.5*full, others share remaining 0.5 equally
-# - If no major designated (2+ authors) -> equal share
-
-def author_share(total_points: float, n_authors: int, is_major: Optional[bool], major_specified: bool) -> float:
-    if n_authors <= 1:
-        return total_points
-    if n_authors == 2:
-        if major_specified and is_major:
-            return total_points * 0.8
-        if major_specified and not is_major:
-            return total_points * 0.5
-        # not specified -> equal split
-        return total_points / 2.0
-    # 3+
-    if major_specified and is_major:
-        return total_points * 0.5
-    if major_specified and not is_major:
-        return (total_points * 0.5) / (n_authors - 1)
-    # not specified -> equal split
-    return total_points / float(n_authors)
-
-# POINT TABLES
-INTL_ARTICLE_POINTS = {
-    # Madde 1
-    "SCIE_Q1": 30,
-    "SCIE_Q2": 20,
-    "SCIE_Q3": 15,
-    "SCIE_Q4": 10,
-    "AHCI": 20,
-    "ESCI_SCOPUS": 10,
-    "OTHER_INTL_INDEXED": 5,
-    "LETTER_NOTE_ABSTRACT_REVIEW": 3,  # only if in a/b/c/d scope
-    "SCIE_CASE_REPORT": 5,
-}
-
-THESIS_DERIVED_POINTS = {
-    # Madde 3
-    "SCIE_SSCI_AHCI": 20,
-    "ESCI_SCOPUS": 10,
-    "OTHER_INTL_INDEXED": 5,
-    "TR_DIZIN": 8,
-    "BKCI_BOOK": 20,
-    "BKCI_CHAPTER": 10,
-    "OTHER_BOOK": 5,
-    "OTHER_BOOK_CHAPTER": 3,
-    "CONF_CPCI": 3,
-    "CONF_OTHER": 2,
-}
-
-NATIONAL_ARTICLE_POINTS = {
-    # Madde 2
-    "TR_DIZIN": 10,
-    "OTHER_REFEREED": 4,
-    "LETTER_NOTE_ABSTRACT_REVIEW": 2,
-}
-
-# Caps & constraints for Madde 3
-THESIS_CAP_TOTAL = 20
-THESIS_GH_CAP = 5  # g+h combined cap
-
-###########################
-# Data Models
-###########################
-@dataclass
-class Record:
-    category: str  # one of: M1_INTL, M2_NATL, M3_THESIS
-    payload: Dict[str, Any]
-
-    def to_json(self):
-        return json.dumps({"category": self.category, "payload": self.payload}, ensure_ascii=False)
-
-###########################
-# Calculation helpers
-###########################
-
-def calc_m1_points(item: Dict[str, Any]) -> float:
-    """Madde 1 – Uluslararası makale puanı (tezden üretilmemiş olmalı)."""
-    base_key = item.get("base_key")
-    total = INTL_ARTICLE_POINTS.get(base_key, 0)
-    n = int(item.get("n_authors", 1))
-    major_specified = bool(item.get("major_specified", True))
-    is_major = bool(item.get("is_major", True))
-    return author_share(total, n, is_major, major_specified)
-
-def calc_m2_points(item: Dict[str, Any]) -> float:
-    base_key = item.get("base_key")
-    total = NATIONAL_ARTICLE_POINTS.get(base_key, 0)
-    n = int(item.get("n_authors", 1))
-    # Madde 2'de diğer yayınlarda toplam puan eşit bölünür (metin öyle diyor),
-    # ancak makale özelindeki kuralı, M1 ile tutarlı olacak şekilde uyguluyoruz.
-    # (TR Dizin/diğer hakemli makalelerde başlıca yazar vurgusu min koşul için önemlidir.)
-    major_specified = bool(item.get("major_specified", True))
-    is_major = bool(item.get("is_major", True))
-    return author_share(total, n, is_major, major_specified)
-
-def calc_m3_points(items: List[Dict[str, Any]]) -> (float, float, float):
-    """Madde 3 toplam puanı, g-h alt limitlerini gözeterek.
-    Returns: (total_after_caps, subtotal, gh_subtotal)
-    """
-    subtotal = 0.0
-    gh_subtotal = 0.0
-    for it in items:
-        key = it.get("base_key")
-        total = THESIS_DERIVED_POINTS.get(key, 0)
-        n = int(it.get("n_authors", 1))
-        major_specified = bool(it.get("major_specified", True))
-        is_major = bool(it.get("is_major", True))
-        pts = author_share(total, n, is_major, major_specified)
-        subtotal += pts
-        if key in ("OTHER_BOOK", "OTHER_BOOK_CHAPTER"):
-            gh_subtotal += pts
-
-    # apply g-h cap
-    over_gh = max(0.0, gh_subtotal - THESIS_GH_CAP)
-    total_after_gh = subtotal - over_gh
-    # apply total cap
-    total_after_caps = min(total_after_gh, THESIS_CAP_TOTAL)
-    return total_after_caps, subtotal, gh_subtotal
-
-###########################
-# UI – Auth
-###########################
-with st.sidebar:
-    st.subheader("Giriş / Kayıt")
-    if "user_id" not in st.session_state:
-        mode = st.radio("Seçim", ["Giriş", "Kayıt ol"], horizontal=True)
-        if mode == "Giriş":
-            u = st.text_input("Kullanıcı adı")
-            p = st.text_input("Parola", type="password")
-            if st.button("Giriş yap"):
-                uid = verify_user(u, p)
-                if uid:
-                    st.session_state["user_id"] = uid
-                    st.session_state["username"] = u
-                    st.success(f"Hoş geldiniz, {u}!")
-                else:
-                    st.error("Kullanıcı adı / parola hatalı.")
-        else:
-            u = st.text_input("Kullanıcı adı")
-            e = st.text_input("E-posta (opsiyonel)")
-            p1 = st.text_input("Parola", type="password")
-            p2 = st.text_input("Parola (tekrar)", type="password")
-            if st.button("Kayıt ol"):
-                if not u or not p1:
-                    st.error("Kullanıcı adı ve parola gerekli.")
-                elif p1 != p2:
-                    st.error("Parolalar uyuşmuyor.")
-                else:
-                    err = register_user(u, e, p1)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.success("Kayıt başarılı. Şimdi giriş yapabilirsiniz.")
-    else:
-        st.success(f"Oturum açık: {st.session_state['username']}")
-        if st.button("Çıkış yap"):
-            for k in ("user_id", "username"):
-                st.session_state.pop(k, None)
-            st.experimental_rerun()
-
-###########################
-# Helper: persist/load records
-###########################
-
-def save_record(user_id: int, rec: Record):
-    conn.execute(
-        "INSERT INTO records (user_id, category, payload) VALUES (?, ?, ?)",
-        (user_id, rec.category, json.dumps(rec.payload, ensure_ascii=False)),
-    )
+def increment_visit():
+    conn = get_conn()
+    conn.execute("UPDATE stats SET value = value + 1 WHERE key='visits'")
     conn.commit()
+    conn.close()
 
+def get_visits() -> int:
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM stats WHERE key='visits'").fetchone()
+    conn.close()
+    return int(row["value"]) if row else 0
 
-def load_records(user_id: int) -> pd.DataFrame:
-    cur = conn.execute("SELECT id, category, payload, created_at FROM records WHERE user_id=? ORDER BY id DESC", (user_id,))
-    rows = cur.fetchall()
-    data = []
-    for rid, cat, payload, created in rows:
-        try:
-            p = json.loads(payload)
-        except Exception:
-            p = {"raw": payload}
-        data.append({"id": rid, "category": cat, **p, "created_at": created})
-    return pd.DataFrame(data)
+def register_user(username: str, password: str) -> Tuple[bool, str]:
+    conn = get_conn()
+    try:
+        salt = os.urandom(16).hex()
+        ph = sha256_hash(password, salt)
+        conn.execute("""INSERT INTO users(username, password_hash, salt, is_admin, created_at)
+                        VALUES (?, ?, ?, 0, ?)""", (username, ph, salt, dt.datetime.utcnow().isoformat()))
+        conn.commit()
+        return True, "Kayıt başarılı."
+    except sqlite3.IntegrityError:
+        return False, "Bu kullanıcı adı zaten mevcut."
+    finally:
+        conn.close()
 
-###########################
-# UI – Main (requires auth)
-###########################
-if "user_id" not in st.session_state:
-    st.info("Devam etmek için lütfen oturum açın veya kayıt olun.")
-    st.stop()
+def authenticate(username: str, password: str) -> Tuple[bool, Dict[str, Any]]:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    conn.close()
+    if not row:
+        return False, {}
+    salt = row["salt"]
+    ph = sha256_hash(password, salt)
+    if ph == row["password_hash"]:
+        return True, {"username": row["username"], "is_admin": bool(row["is_admin"])}
+    return False, {}
 
-uid = st.session_state["user_id"]
+def list_users() -> List[sqlite3.Row]:
+    conn = get_conn()
+    rows = conn.execute("SELECT id, username, is_admin, created_at FROM users ORDER BY id").fetchall()
+    conn.close()
+    return rows
 
-TAB = st.tabs([
-    "Puan Hesaplayıcı",
-    "Kayıtlarım",
-    "İçe/Dışa Aktar",
-    "Uygunluk Özeti",
-    "Hakkında"
-])
+def set_admin(username: str, is_admin: bool):
+    conn = get_conn()
+    conn.execute("UPDATE users SET is_admin=? WHERE username=?", (1 if is_admin else 0, username))
+    conn.commit()
+    conn.close()
 
-###########################
-# Tab: Puan Hesaplayıcı
-###########################
-with TAB[0]:
-    st.subheader("Yayın/Etkinlik Ekle")
-    cat = st.selectbox(
-        "Kategori",
-        [
-            ("M1_INTL", "Uluslararası Makale (Madde 1) – Tezden üretilmemiş"),
-            ("M2_NATL", "Ulusal Makale (Madde 2) – Tezden üretilmemiş"),
-            ("M3_THESIS", "Lisansüstü Tezden Üretilmiş Yayın (Madde 3)"),
-        ],
-        format_func=lambda x: x[1],
-    )
+def reset_password(username: str, new_password: str):
+    conn = get_conn()
+    salt = os.urandom(16).hex()
+    ph = sha256_hash(new_password, salt)
+    conn.execute("UPDATE users SET password_hash=?, salt=? WHERE username=?", (ph, salt, username))
+    conn.commit()
+    conn.close()
 
-    cat_key = cat[0]
+def save_record(owner: str, payload: Dict[str, Any], total: float, breakdown: Dict[str, Any]):
+    conn = get_conn()
+    conn.execute("""INSERT INTO records(owner, payload, total, breakdown, created_at)
+                    VALUES (?, ?, ?, ?, ?)""",
+                 (owner, json.dumps(payload, ensure_ascii=False), total, json.dumps(breakdown, ensure_ascii=False),
+                  dt.datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
 
-    if cat_key == "M1_INTL":
-        base_key = st.selectbox(
-            "Dergi/Tip",
-            [
-                ("SCIE_Q1", "SCIE/SSCI – Q1 (30)"),
-                ("SCIE_Q2", "SCIE/SSCI – Q2 (20)"),
-                ("SCIE_Q3", "SCIE/SSCI – Q3 (15)"),
-                ("SCIE_Q4", "SCIE/SSCI – Q4 (10)"),
-                ("AHCI", "AHCI (20)"),
-                ("ESCI_SCOPUS", "ESCI/Scopus (10)"),
-                ("OTHER_INTL_INDEXED", "Diğer uluslararası indeksli (5)"),
-                ("LETTER_NOTE_ABSTRACT_REVIEW", "Editöre mektup/araştırma notu/özet/kitap kritiği (3)"),
-                ("SCIE_CASE_REPORT", "SCIE vaka takdimi (5)"),
-            ],
-            format_func=lambda x: x[1],
-        )
-        n_authors = st.number_input("Yazar sayısı", min_value=1, step=1, value=1)
-        major_specified = st.checkbox("Başlıca yazar belirtilmiş", value=True)
-        is_major = st.checkbox("Ben başlıca yazarıyım", value=True)
-        title = st.text_input("Eser başlığı (opsiyonel)")
-        if st.button("Ekle (Madde 1)"):
-            item = {
-                "base_key": base_key[0],
-                "n_authors": int(n_authors),
-                "major_specified": bool(major_specified),
-                "is_major": bool(is_major),
-                "title": title,
-            }
-            save_record(uid, Record(category="M1_INTL", payload=item))
-            st.success("Kaydedildi.")
-
-    elif cat_key == "M2_NATL":
-        base_key = st.selectbox(
-            "Dergi/Tip",
-            [
-                ("TR_DIZIN", "TR Dizin (10)"),
-                ("OTHER_REFEREED", "Diğer hakemli (4)"),
-                ("LETTER_NOTE_ABSTRACT_REVIEW", "Editöre mektup/araştırma notu/özet/kitap kritiği (2)"),
-            ],
-            format_func=lambda x: x[1],
-        )
-        n_authors = st.number_input("Yazar sayısı", min_value=1, step=1, value=1)
-        major_specified = st.checkbox("Başlıca yazar belirtilmiş", value=True)
-        is_major = st.checkbox("Ben başlıca yazarıyım", value=True)
-        title = st.text_input("Eser başlığı (opsiyonel)")
-        if st.button("Ekle (Madde 2)"):
-            item = {
-                "base_key": base_key[0],
-                "n_authors": int(n_authors),
-                "major_specified": bool(major_specified),
-                "is_major": bool(is_major),
-                "title": title,
-            }
-            save_record(uid, Record(category="M2_NATL", payload=item))
-            st.success("Kaydedildi.")
-
-    else:  # M3_THESIS
-        base_key = st.selectbox(
-            "Yayın türü",
-            [
-                ("SCIE_SSCI_AHCI", "SCIE/SSCI/AHCI makale (20)"),
-                ("ESCI_SCOPUS", "ESCI/Scopus makale (10)"),
-                ("OTHER_INTL_INDEXED", "Diğer uluslararası indeksli makale (5)"),
-                ("TR_DIZIN", "TR Dizin makale (8)"),
-                ("BKCI_BOOK", "BKCI kitap (20)"),
-                ("BKCI_CHAPTER", "BKCI kitap bölümü (10)"),
-                ("OTHER_BOOK", "Diğer uluslararası/ulusal kitap (5) [g]"),
-                ("OTHER_BOOK_CHAPTER", "Diğer uluslararası/ulusal kitap bölümü (3) [h]"),
-                ("CONF_CPCI", "Uluslararası toplantı tam metin/özet CPCI'da (3)"),
-                ("CONF_OTHER", "Diğer uluslararası/ulusal toplantı tam metin/özet (2)"),
-            ],
-            format_func=lambda x: x[1],
-        )
-        n_authors = st.number_input("Yazar sayısı", min_value=1, step=1, value=1)
-        major_specified = st.checkbox("Başlıca yazar belirtilmiş", value=True)
-        is_major = st.checkbox("Ben başlıca yazarıyım", value=True)
-        title = st.text_input("Eser başlığı (opsiyonel)")
-        if st.button("Ekle (Madde 3)"):
-            item = {
-                "base_key": base_key[0],
-                "n_authors": int(n_authors),
-                "major_specified": bool(major_specified),
-                "is_major": bool(is_major),
-                "title": title,
-            }
-            save_record(uid, Record(category="M3_THESIS", payload=item))
-            st.success("Kaydedildi.")
-
-    st.divider()
-
-    # On-the-fly total
-    df_user = load_records(uid)
-    st.subheader("Anlık Toplam")
-    total_m1 = 0.0
-    total_m2 = 0.0
-    m3_items: List[Dict[str, Any]] = []
-
-    for _, r in df_user.iterrows():
-        cat = r.get("category")
-        payload = {k: r.get(k) for k in r.index if k not in ("id", "category", "created_at")}
-        if cat == "M1_INTL":
-            total_m1 += calc_m1_points(payload)
-        elif cat == "M2_NATL":
-            total_m2 += calc_m2_points(payload)
-        elif cat == "M3_THESIS":
-            m3_items.append(payload)
-
-    m3_total, m3_subtotal, m3_gh = calc_m3_points(m3_items)
-
-    grand_total = total_m1 + total_m2 + m3_total
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Madde 1 (Uluslararası)", f"{total_m1:.2f}")
-    c2.metric("Madde 2 (Ulusal)", f"{total_m2:.2f}")
-    c3.metric("Madde 3 (Tezden) – Net", f"{m3_total:.2f}", help=f"Ham: {m3_subtotal:.2f} | g+h: {m3_gh:.2f} (g+h max {THESIS_GH_CAP}) | Madde3 max {THESIS_CAP_TOTAL}")
-    c4.metric("GENEL TOPLAM", f"{grand_total:.2f}")
-
-###########################
-# Tab: Kayıtlarım
-###########################
-with TAB[1]:
-    st.subheader("Kayıtlarım")
-    df = load_records(uid)
-    if df.empty:
-        st.info("Henüz kayıt yok.")
+def list_records(owner: str=None) -> List[sqlite3.Row]:
+    conn = get_conn()
+    if owner is None:
+        rows = conn.execute("SELECT * FROM records ORDER BY id DESC").fetchall()
     else:
-        # pretty view
-        view_df = df.copy()
-        view_df["payload"] = view_df.apply(lambda r: json.dumps({k: r[k] for k in r.index if k not in ("id","category","payload","created_at")}, ensure_ascii=False), axis=1)
-        show_cols = ["id", "category", "title", "base_key", "n_authors", "major_specified", "is_major", "created_at"]
-        show_cols = [c for c in show_cols if c in view_df.columns]
-        st.dataframe(view_df[show_cols], use_container_width=True)
+        rows = conn.execute("SELECT * FROM records WHERE owner=? ORDER BY id DESC", (owner,)).fetchall()
+    conn.close()
+    return rows
 
-        sel = st.multiselect("Silinecek kayıt id'leri", view_df["id"].tolist())
-        if st.button("Seçilenleri sil") and sel:
-            conn.executemany("DELETE FROM records WHERE id=? AND user_id=?", [(rid, uid) for rid in sel])
-            conn.commit()
-            st.success("Silindi.")
-            st.experimental_rerun()
+def delete_record(record_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM records WHERE id=?", (record_id,))
+    conn.commit()
+    conn.close()
 
-###########################
-# Tab: İçe/Dışa Aktar
-###########################
-with TAB[2]:
-    st.subheader("Dışa aktar (CSV/JSON)")
-    df = load_records(uid)
-    if not df.empty:
-        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("CSV indir", data=csv_bytes, file_name="kayitlarim.csv", mime="text/csv")
-        json_bytes = df.to_json(orient="records", force_ascii=False).encode("utf-8")
-        st.download_button("JSON indir", data=json_bytes, file_name="kayitlarim.json", mime="application/json")
+# =========================
+# Point Rules (Tablo 10 - 2025)
+# =========================
+@dataclass
+class Totals:
+    total: float
+    total_excluding_thesis: float
+    checks: Dict[str, Any]
+    breakdown: Dict[str, Any]
+
+def cap(value: float, maxv: float) -> float:
+    return min(value, maxv)
+
+def article_share(points: float, num_authors: int, role: str, has_primary_author: bool=True) -> float:
+    """
+    role: 'primary', 'second' (only for 2 authors), 'other', 'equal' (no primary indicated)
+    """
+    if num_authors <= 0:
+        return 0.0
+    if num_authors == 1:
+        return points
+    if not has_primary_author:
+        return points / num_authors
+    if num_authors == 2:
+        if role == "primary":
+            return points * 0.8
+        else:
+            return points * 0.5
+    # 3+ authors
+    if role == "primary":
+        return points * 0.5
     else:
-        st.info("Dışa aktarılacak kayıt yok.")
+        return (points * 0.5) / (num_authors - 1)
 
-    st.subheader("İçe aktar (CSV)")
-    up = st.file_uploader("CSV yükle (daha önce bu uygulamadan indirilmiş format)", type=["csv"])
-    if up is not None:
-        try:
-            imp = pd.read_csv(up)
-            # basic sanity
-            needed = {"category", "base_key", "n_authors"}
-            if not needed.issubset(set(imp.columns)):
-                st.error(f"CSV kolonları eksik. Gerekli: {needed}")
+def compute_points(data: Dict[str, Any]) -> Totals:
+    """
+    data structure:
+    {
+      "after_degree": bool, # publishings after doctorate/specialty (for checks)
+      "articles": [  # non-thesis (Madde 1 & 2)
+        { "type": "Q1|Q2|Q3|Q4|AHCI|ESCI|OTHER_INT|TRDIZIN|OTHER_NAT|LETTER|CASE",
+          "num_authors": int, "role": "primary|second|other|equal", "has_primary": bool }
+      ],
+      "thesis_articles": [ # Madde 3
+        { "type": "SCIE_SSCI_AHCI|ESCI_SCOPUS|OTHER_INT|TRDIZIN|BKCI_BOOK|BKCI_CHAPTER|OTHER_BOOK|OTHER_BOOK_CH|CPCI|OTHER_CONF",
+          "num_authors": int, "role": "primary|second|other|equal", "has_primary": bool }
+      ],
+      "citations": { "wos_scopus": int, "bkci": int, "trdizin": int, "other": int },
+      "supervisions": { "phd": int, "ms": int, "phd_as_second": int, "ms_as_second": int },
+      "projects": {
+          "eu_tubitak_coord": int, "eu_tubitak_researcher": int, "eu_tubitak_advisor": int,
+          "intl_project_any": int, "public_private_rnd": int, "bap_coord": int
+      },
+      "meetings": { "cpci": int, "other": int },
+      "education": { "semester_mode": int, "year_mode": int, "has_2yr_faculty": bool },
+      "patents": {
+          "intl": int, "national": int, "utility": int, "app": int,
+          "intl_inventors": int, "national_inventors": int, "utility_inventors": int, "app_inventors": int
+      },
+      "awards": { "yok_phd": int, "yok_high": int, "tubitak_science": int, "tubitak_encour": int, "tuba_gebip": int, "tuba_tesep": int },
+      "editor": { "wos_scopus": int, "bkci_scopus_book": int, "trdizin": int },
+      "other": { "hindex5": bool, "top300_6m": bool }
+    }
+    """
+    # --- Article base points (Madde 1 & 2) ---
+    base_map = {
+        "Q1": 30, "Q2": 20, "Q3": 15, "Q4": 10,
+        "AHCI": 20, "ESCI": 10, "OTHER_INT": 5,
+        "TRDIZIN": 10, "OTHER_NAT": 4, "LETTER": 3, "CASE": 5
+    }
+
+    # --- Thesis publications (Madde 3) ---
+    thesis_map = {
+        "SCIE_SSCI_AHCI": 20, "ESCI_SCOPUS": 10, "OTHER_INT": 5, "TRDIZIN": 8,
+        "BKCI_BOOK": 20, "BKCI_CHAPTER": 10, "OTHER_BOOK": 5, "OTHER_BOOK_CH": 3,
+        "CPCI": 3, "OTHER_CONF": 2
+    }
+
+    # Articles (non-thesis)
+    total_articles = 0.0
+    total_articles_details = []
+    count_1a_primary_after = 0  # for check (a bendinden en az 3 makalede başlıca yazar, >=40 puan)
+    total_1a_points_after = 0.0
+
+    for a in data.get("articles", []):
+        t = a["type"]
+        pts = base_map.get(t, 0)
+        share = article_share(pts, a["num_authors"], a["role"], a.get("has_primary", True))
+        total_articles += share
+        total_articles_details.append((t, pts, share, a["num_authors"], a["role"]))
+        # check for 1-a condition
+        if t in ["Q1","Q2","Q3","Q4"] and a["role"] == "primary" and data.get("after_degree", True):
+            count_1a_primary_after += 1
+            total_1a_points_after += share
+
+    # National article condition (Madde 2) tracking (ikisi TR Dizin, >=3 yayın; en az ikisinde başlıca)
+    nat_total = 0.0
+    nat_primary_count = 0
+    nat_trdizin_count = 0
+    nat_pub_count = 0
+    for a in data.get("articles", []):
+        if a["type"] in ["TRDIZIN", "OTHER_NAT"] or a["type"] == "LETTER":
+            nat_pub_count += 1 if a["type"] in ["TRDIZIN", "OTHER_NAT"] else 0
+            if a["type"] == "TRDIZIN":
+                nat_trdizin_count += 1
+            if a["role"] == "primary":
+                nat_primary_count += 1
+            nat_total += base_map.get(a["type"], 0)  # raw points, not share, for condition check only
+
+    # Thesis publications (Madde 3)
+    thesis_total_raw = 0.0
+    thesis_total_share = 0.0
+    thesis_any_ah_to_h = False
+    thesis_details = []
+    for tpub in data.get("thesis_articles", []):
+        t = tpub["type"]
+        pts = thesis_map.get(t, 0)
+        thesis_total_raw += pts
+        share = article_share(pts, tpub["num_authors"], tpub["role"], tpub.get("has_primary", True))
+        thesis_total_share += share
+        thesis_details.append((t, pts, share, tpub["num_authors"], tpub["role"]))
+        if t in ["SCIE_SSCI_AHCI","ESCI_SCOPUS","OTHER_INT","TRDIZIN","BKCI_BOOK","BKCI_CHAPTER","OTHER_BOOK","OTHER_BOOK_CH"]:
+            thesis_any_ah_to_h = True
+    thesis_total_capped = cap(thesis_total_share, 20.0)  # max 20 from Madde 3
+
+    # Citations (Madde 5) — max 10, and at least 5 from after-degree publications
+    c = data.get("citations", {})
+    c_points = c.get("wos_scopus", 0)*3 + c.get("bkci", 0)*2 + c.get("trdizin", 0)*2 + c.get("other", 0)*1
+    c_points_capped = cap(c_points, 10.0)
+
+    # Supervisions (Madde 6) — max 10; second advisor gets half
+    s = data.get("supervisions", {})
+    s_points = s.get("phd",0)*5 + s.get("ms",0)*3 + s.get("phd_as_second",0)*2.5 + s.get("ms_as_second",0)*1.5
+    s_points_capped = cap(s_points, 10.0)
+
+    # Projects (Madde 7) — max 20
+    p = data.get("projects", {})
+    p_points = (p.get("eu_tubitak_coord",0)*15 + p.get("eu_tubitak_researcher",0)*10 + p.get("eu_tubitak_advisor",0)*5 +
+                p.get("intl_project_any",0)*10 + p.get("public_private_rnd",0)*5 + p.get("bap_coord",0)*3)
+    p_points_capped = cap(p_points, 20.0)
+
+    # Meetings (Madde 8) — max 10
+    m = data.get("meetings", {})
+    m_points = m.get("cpci",0)*5 + m.get("other",0)*3
+    m_points_capped = cap(m_points, 10.0)
+
+    # Education (Madde 9) — min 2, max 6
+    edu = data.get("education", {})
+    edu_points = 0.0
+    # period-based: semester_mode (>=4 farklı yarıyıl) → 2 puan; year_mode (>=2 farklı yıl) → 2 puan
+    if edu.get("semester_mode", 0) >= 4:
+        edu_points += 2
+    if edu.get("year_mode", 0) >= 2:
+        edu_points += 2
+    if edu.get("has_2yr_faculty", False):
+        edu_points += 2
+    edu_points_capped = cap(edu_points, 6.0)
+
+    # Patents (Madde 10) — points divided by inventors
+    pat = data.get("patents", {})
+    def safe_div(x, n):
+        return (x / n) if n and n>0 else 0.0
+    pat_points = 0.0
+    pat_points += safe_div(20*pat.get("intl",0), max(1, pat.get("intl_inventors",1)))
+    pat_points += safe_div(10*pat.get("national",0), max(1, pat.get("national_inventors",1)))
+    pat_points += safe_div(5*pat.get("utility",0), max(1, pat.get("utility_inventors",1)))
+    pat_points += safe_div(2*pat.get("app",0), max(1, pat.get("app_inventors",1)))
+
+    # Awards (Madde 11) — max 25
+    aw = data.get("awards", {})
+    aw_points = (aw.get("yok_phd",0)*25 + aw.get("yok_high",0)*25 + aw.get("tubitak_science",0)*25 +
+                 aw.get("tubitak_encour",0)*25 + aw.get("tuba_gebip",0)*25 + aw.get("tuba_tesep",0)*25)
+    aw_points_capped = cap(aw_points, 25.0)
+
+    # Editor (Madde 12) — max 4
+    ed = data.get("editor", {})
+    ed_points = ed.get("wos_scopus",0)*2 + ed.get("bkci_scopus_book",0)*1 + ed.get("trdizin",0)*1
+    ed_points_capped = cap(ed_points, 4.0)
+
+    # Other (Madde 13) — max 10
+    oth = data.get("other", {})
+    other_points = (5 if oth.get("hindex5", False) else 0) + (5 if oth.get("top300_6m", False) else 0)
+    other_points_capped = cap(other_points, 10.0)
+
+    total_excl_thesis = (total_articles + c_points_capped + s_points_capped + p_points_capped +
+                         m_points_capped + edu_points_capped + pat_points + aw_points_capped +
+                         ed_points_capped + other_points_capped)
+
+    total_all = total_excl_thesis + thesis_total_capped
+
+    # Compliance checks
+    checks = {}
+    checks["overall_min_100"] = total_all >= 100.0
+    checks["min_90_after_excl_thesis"] = total_excl_thesis >= 90.0  # NOTE: User should ensure after-degree filtering where relevant
+    checks["1a_primary_at_least3_and_40pts"] = (count_1a_primary_after >= 3 and total_1a_points_after >= 40.0)
+    checks["2_national_at_least3_with2_trdizin_and_2_primary"] = (nat_pub_count >= 3 and nat_trdizin_count >= 2 and nat_primary_count >= 2)
+    checks["3_thesis_at_least_one_from_a_h"] = thesis_any_ah_to_h
+    checks["5_citation_min5_after"] = c_points_capped >= 5.0  # user should reflect after-degree ones
+    checks["8_meeting_min5_after"] = m_points_capped >= 5.0
+    checks["9_education_min2"] = edu_points_capped >= 2.0
+
+    breakdown = {
+        "1_2_articles_total_share": round(total_articles, 4),
+        "3_thesis_share_capped20": round(thesis_total_capped, 4),
+        "5_citations_capped10": round(c_points_capped, 4),
+        "6_supervisions_capped10": round(s_points_capped, 4),
+        "7_projects_capped20": round(p_points_capped, 4),
+        "8_meetings_capped10": round(m_points_capped, 4),
+        "9_education_capped6": round(edu_points_capped, 4),
+        "10_patents": round(pat_points, 4),
+        "11_awards_capped25": round(aw_points_capped, 4),
+        "12_editor_capped4": round(ed_points_capped, 4),
+        "13_other_capped10": round(other_points_capped, 4),
+        "TOTAL_EXCLUDING_THESIS": round(total_excl_thesis, 4),
+        "TOTAL_ALL": round(total_all, 4),
+        "detail_articles": total_articles_details,
+        "detail_thesis": thesis_details
+    }
+    return Totals(total=total_all, total_excluding_thesis=total_excl_thesis, checks=checks, breakdown=breakdown)
+
+# =========================
+# UI
+# =========================
+def login_ui():
+    st.markdown("### Giriş / Kayıt")
+    tabs = st.tabs(["Giriş", "Kayıt Ol"])
+    with tabs[0]:
+        u = st.text_input("Kullanıcı adı", key="login_user")
+        p = st.text_input("Şifre", type="password", key="login_pass")
+        if st.button("Giriş"):
+            ok, info = authenticate(u, p)
+            if ok:
+                st.session_state["user"] = info
+                st.success(f"Hoş geldiniz, {info['username']}!")
+                st.experimental_rerun()
             else:
-                for _, r in imp.iterrows():
-                    payload = {k: r[k] for k in imp.columns if k not in ("id", "created_at")}
-                    save_record(uid, Record(category=str(r["category"]), payload=payload))
-                st.success("Kayıtlar içe aktarıldı.")
-        except Exception as e:
-            st.error(f"Hata: {e}")
+                st.error("Kullanıcı adı veya şifre hatalı.")
+    with tabs[1]:
+        u = st.text_input("Yeni kullanıcı adı", key="reg_user")
+        p1 = st.text_input("Şifre", type="password", key="reg_p1")
+        p2 = st.text_input("Şifre (tekrar)", type="password", key="reg_p2")
+        if st.button("Kayıt Ol"):
+            if not u or not p1:
+                st.warning("Kullanıcı adı ve şifre gerekli.")
+            elif p1 != p2:
+                st.error("Şifreler eşleşmiyor.")
+            else:
+                ok, msg = register_user(u, p1)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
 
-###########################
-# Tab: Uygunluk Özeti (Basit kontroller)
-###########################
-with TAB[3]:
-    st.subheader("Uygunluk Özeti – (Basit denetim)")
-    df = load_records(uid)
-    if df.empty:
-        st.info("Kayıt yok.")
-    else:
-        # Madde 3: en az bir yayın şartı
-        has_m3_any = (df["category"] == "M3_THESIS").any()
-        # M3 totals
-        m3_items = []
-        for _, r in df[df["category"] == "M3_THESIS"].iterrows():
-            payload = {k: r.get(k) for k in r.index if k not in ("id", "category", "created_at")}
-            m3_items.append(payload)
-        m3_total, m3_subtotal, m3_gh = calc_m3_points(m3_items)
+def article_entry(label: str, thesis: bool=False) -> List[Dict[str, Any]]:
+    st.markdown(f"#### {label}")
+    rows = st.number_input("Kaç kayıt gireceksiniz?", min_value=0, max_value=200, value=0, step=1, key=f"{label}_rows")
+    data = []
+    for i in range(rows):
+        with st.expander(f"{label} #{i+1}", expanded=False):
+            if not thesis:
+                type_opt = st.selectbox(
+                    "Tür",
+                    ["Q1","Q2","Q3","Q4","AHCI","ESCI","OTHER_INT","TRDIZIN","OTHER_NAT","LETTER","CASE"],
+                    key=f"{label}_type_{i}"
+                )
+            else:
+                type_opt = st.selectbox(
+                    "Tür (Tezden Üretilmiş Yayın)",
+                    ["SCIE_SSCI_AHCI","ESCI_SCOPUS","OTHER_INT","TRDIZIN","BKCI_BOOK","BKCI_CHAPTER","OTHER_BOOK","OTHER_BOOK_CH","CPCI","OTHER_CONF"],
+                    key=f"{label}_type_{i}"
+                )
+            num_auth = st.number_input("Yazar sayısı", min_value=1, value=1, step=1, key=f"{label}_num_{i}")
+            has_pri = st.checkbox("Başlıca yazar belirtilmiş", value=True, key=f"{label}_haspri_{i}")
+            role = st.selectbox("Sizdeki rol", ["primary","second","other","equal"], key=f"{label}_role_{i}")
+            data.append({"type": type_opt, "num_authors": int(num_auth), "has_primary": has_pri, "role": role})
+    return data
 
-        # M1 requirement: a bendinden (SCIE/SSCI Q1–Q4) en az 40 puan ve en az 3 makalede başlıca yazar olmak
-        m1_major_count = 0
-        m1_major_points = 0.0
-        for _, r in df[df["category"] == "M1_INTL"].iterrows():
-            bk = r.get("base_key")
-            if bk in ("SCIE_Q1", "SCIE_Q2", "SCIE_Q3", "SCIE_Q4"):
-                payload = {k: r.get(k) for k in r.index if k not in ("id", "category", "created_at")}
-                pts = calc_m1_points(payload)
-                m1_major_points += pts
-                if r.get("is_major") in (True, "True", 1, "1"):
-                    m1_major_count += 1
+def citations_entry():
+    st.markdown("#### 5) Atıflar")
+    w = st.number_input("SCIE/SSCI/AHCI/ESCI/Scopus kapsamındaki atıf sayısı", min_value=0, value=0)
+    b = st.number_input("BKCI kapsamındaki kitapta atıf sayısı", min_value=0, value=0)
+    t = st.number_input("TR Dizin kapsamındaki dergide atıf sayısı", min_value=0, value=0)
+    o = st.number_input("Diğer uluslararası/ulusal atıf sayısı", min_value=0, value=0)
+    return {"wos_scopus": int(w), "bkci": int(b), "trdizin": int(t), "other": int(o)}
 
-        # M2 requirement: en az 3 yayın; ikisi TR Dizin; bu yayınlardan en az ikisi başlıca yazar
-        m2_rows = df[df["category"] == "M2_NATL"]
-        m2_count = len(m2_rows)
-        m2_trd_count = int((m2_rows.get("base_key") == "TR_DIZIN").sum()) if not m2_rows.empty else 0
-        m2_major_count = int((m2_rows.get("is_major") == True).sum()) if not m2_rows.empty else 0
+def supervisions_entry():
+    st.markdown("#### 6) Lisansüstü Tez Danışmanlığı")
+    phd = st.number_input("Tamamlanmış Doktora tezi (asıl danışman)", min_value=0, value=0)
+    ms = st.number_input("Tamamlanmış Yüksek lisans tezi (asıl danışman)", min_value=0, value=0)
+    phd2 = st.number_input("Tamamlanmış Doktora tezi (ikinci danışman)", min_value=0, value=0)
+    ms2 = st.number_input("Tamamlanmış Yüksek lisans tezi (ikinci danışman)", min_value=0, value=0)
+    return {"phd": int(phd), "ms": int(ms), "phd_as_second": int(phd2), "ms_as_second": int(ms2)}
 
-        # Education min 2 puan – bu uygulamada eğitim modülü yok, uyarı notu veriyoruz
-        st.write("**Not:** Eğitim-Öğretim (Madde 9) ve diğer bazı kalemler bu sürümde hesaplanmıyor; lütfen bu kalemleri ayrıca kontrol edin.")
+def projects_entry():
+    st.markdown("#### 7) Bilimsel Araştırma Projeleri")
+    eu_c = st.number_input("AB/TÜBİTAK — Koordinatör/Yürütücü", min_value=0, value=0)
+    eu_r = st.number_input("AB/TÜBİTAK — Araştırmacı", min_value=0, value=0)
+    eu_d = st.number_input("AB/TÜBİTAK — Danışman", min_value=0, value=0)
+    intl = st.number_input("Uluslararası destekli proje (yür./arş./dan.)", min_value=0, value=0)
+    pp = st.number_input("Kamu/özel Ar-Ge/Ür-Ge projesi (yür./arş./dan.)", min_value=0, value=0)
+    bap = st.number_input("Üniversite BAP (tez/uzmanlık projeleri hariç) — Yürütücü", min_value=0, value=0)
+    return {"eu_tubitak_coord": int(eu_c), "eu_tubitak_researcher": int(eu_r), "eu_tubitak_advisor": int(eu_d),
+            "intl_project_any": int(intl), "public_private_rnd": int(pp), "bap_coord": int(bap)}
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("#### Madde 3 – Tezden Üretilmiş Yayın")
-            st.write(f"- En az bir yayın var mı? **{'Evet' if has_m3_any else 'Hayır'}**")
-            st.write(f"- Madde 3 Net Toplam: **{m3_total:.2f}** (Ham: {m3_subtotal:.2f}; g+h: {m3_gh:.2f} – sınır {THESIS_GH_CAP})")
-        with col2:
-            st.markdown("#### Madde 1 – SCIE/SSCI (a bendi) Başlıca Yazar Şartı")
-            st.write(f"- Başlıca yazar olduğunuz SCIE/SSCI (Q1–Q4) makale sayısı: **{m1_major_count}** (gereken ≥ 3)")
-            st.write(f"- Bu makalelerden elde edilen toplam puan: **{m1_major_points:.2f}** (gereken ≥ 40)")
+def meetings_entry():
+    st.markdown("#### 8) Bilimsel Toplantı")
+    cpci = st.number_input("Uluslararası toplantı — CPCI kayıtlı", min_value=0, value=0)
+    other = st.number_input("Diğer uluslararası/ulusal toplantı", min_value=0, value=0)
+    return {"cpci": int(cpci), "other": int(other)}
 
-        st.markdown("#### Madde 2 – Ulusal Makale Şartı")
-        st.write(f"- Ulusal makale sayısı: **{m2_count}** (gereken ≥ 3; ikisi TR Dizin olmalı)")
-        st.write(f"- TR Dizin sayısı: **{m2_trd_count}** (gereken ≥ 2)")
-        st.write(f"- Başlıca yazar olduğunuz ulusal makale sayısı: **{m2_major_count}** (gereken ≥ 2)")
+def education_entry():
+    st.markdown("#### 9) Eğitim-Öğretim")
+    sem = st.number_input("Dönemlik programlarda **farklı yarıyıl** sayısı (>=4 ise 2 puan)", min_value=0, value=0)
+    yr = st.number_input("Yıllık programlarda **farklı yıl** sayısı (>=2 ise 2 puan)", min_value=0, value=0)
+    has2 = st.checkbox("Uzmanlıktan sonra ≥2 yıl kadrolu öğretim elemanı (otomatik 2 puan)", value=False)
+    return {"semester_mode": int(sem), "year_mode": int(yr), "has_2yr_faculty": bool(has2)}
 
-###########################
-# Tab: Hakkında
-###########################
-with TAB[4]:
-    st.subheader("Hakkında")
-    st.markdown(
-        """
-        Bu araç, ÜAK 2025 Tablo 10 – Sağlık Bilimleri Temel Alanı puan kurallarını baz alır ve
-        kullanıcıların kişisel hesaplamalarını kolaylaştırmak amacıyla hazırlanmıştır. Resmî bir araç değildir.
+def patents_entry():
+    st.markdown("#### 10) Patent / Faydalı Model")
+    intl = st.number_input("Tescilli uluslararası patent sayısı", min_value=0, value=0)
+    intl_inv = st.number_input("Uluslararası patent başına mucit sayısı (ortalama)", min_value=1, value=1)
+    nat = st.number_input("Tescilli ulusal patent sayısı", min_value=0, value=0)
+    nat_inv = st.number_input("Ulusal patent başına mucit sayısı (ortalama)", min_value=1, value=1)
+    uti = st.number_input("Tescilli faydalı model sayısı", min_value=0, value=0)
+    uti_inv = st.number_input("Faydalı model başına mucit sayısı (ortalama)", min_value=1, value=1)
+    app = st.number_input("Kişisel patent başvurusu sayısı", min_value=0, value=0)
+    app_inv = st.number_input("Patent başvurusu başına mucit sayısı (ortalama)", min_value=1, value=1)
+    return {"intl": int(intl), "national": int(nat), "utility": int(uti), "app": int(app),
+            "intl_inventors": int(intl_inv), "national_inventors": int(nat_inv),
+            "utility_inventors": int(uti_inv), "app_inventors": int(app_inv)}
 
-        **Geri Bildirim:** Eksik gördüğünüz maddeler (Atıf, Proje, Eğitim, Patent vb.) için ek modüller eklenebilir.
-        Lütfen ihtiyaçlarınızı iletin.
-        """
-    )
+def awards_entry():
+    st.markdown("#### 11) Ödüller")
+    yok_phd = st.number_input("YÖK Yılın Doktora Tezi Ödülü", min_value=0, value=0)
+    yok_high = st.number_input("YÖK Üstün Başarı Ödülü", min_value=0, value=0)
+    tub_sci = st.number_input("TÜBİTAK Bilim Ödülü", min_value=0, value=0)
+    tub_enc = st.number_input("TÜBİTAK Teşvik Ödülü", min_value=0, value=0)
+    tuba_g = st.number_input("TÜBA GEBİP Ödülü", min_value=0, value=0)
+    tuba_t = st.number_input("TÜBA TESEP Ödülü", min_value=0, value=0)
+    return {"yok_phd": int(yok_phd), "yok_high": int(yok_high), "tubitak_science": int(tub_sci),
+            "tubitak_encour": int(tub_enc), "tuba_gebip": int(tuba_g), "tuba_tesep": int(tuba_t)}
+
+def editor_entry():
+    st.markdown("#### 12) Editörlük")
+    w = st.number_input("SCIE/SSCI/AHCI/ESCI/Scopus kapsamındaki dergide editörlük", min_value=0, value=0)
+    b = st.number_input("BKCI/Scopus kapsamındaki kitapta editörlük", min_value=0, value=0)
+    t = st.number_input("TR Dizin kapsamındaki dergide editörlük", min_value=0, value=0)
+    return {"wos_scopus": int(w), "bkci_scopus_book": int(b), "trdizin": int(t)}
+
+def other_entry():
+    st.markdown("#### 13) Diğer")
+    h5 = st.checkbox("Web of Science h-indeksi ≥ 5", value=False)
+    top300 = st.checkbox("İlk 300 üniversitede ≥6 ay yurt dışı (kesintisiz) araştırma/öğretim", value=False)
+    return {"hindex5": bool(h5), "top300_6m": bool(top300)}
+
+def admin_panel():
+    st.markdown("## 🔐 Admin Paneli")
+    st.info("Admin yetkisi, ADMIN_USER ile giriş yapan kullanıcıya atanır (varsayılan: admin/admin). Lütfen üretimde değiştirin.")
+    visits = get_visits()
+    st.metric("Toplam ziyaret", visits)
+
+    st.subheader("Kullanıcılar")
+    users = list_users()
+    cols = st.columns([2,1,2,2,2])
+    cols[0].markdown("**Kullanıcı adı**")
+    cols[1].markdown("**Admin?**")
+    cols[2].markdown("**Oluşturulma**")
+    cols[3].markdown("**Admin ata/kaldır**")
+    cols[4].markdown("**Şifre sıfırla**")
+    for u in users:
+        c = st.columns([2,1,2,2,2])
+        c[0].write(u["username"])
+        c[1].write("Evet" if u["is_admin"] else "Hayır")
+        c[2].write(u["created_at"])
+        with c[3]:
+            if st.button(("Admin Kaldır" if u["is_admin"] else "Admin Yap"), key=f"adm_{u['id']}"):
+                set_admin(u["username"], not bool(u["is_admin"]))
+                st.success("Güncellendi.")
+                st.experimental_rerun()
+        with c[4]:
+            newp = st.text_input("Yeni şifre", key=f"np_{u['id']}", type="password")
+            if st.button("Sıfırla", key=f"rp_{u['id']}"):
+                if newp:
+                    reset_password(u["username"], newp)
+                    st.success("Şifre güncellendi.")
+                else:
+                    st.warning("Şifre boş olamaz.")
+
+    st.subheader("Kayıtlar")
+    recs = list_records()
+    st.write(f"Toplam kayıt: {len(recs)}")
+    # export
+    if st.button("Kayıtları JSON olarak indir"):
+        js = [dict(r) for r in recs]
+        st.download_button("JSON indir", json.dumps(js, ensure_ascii=False, indent=2), file_name="records.json")
+    for r in recs:
+        with st.expander(f"#{r['id']} • {r['owner']} • {r['created_at']} • Toplam: {r['total']}"):
+            st.json(json.loads(r["payload"]))
+            st.json(json.loads(r["breakdown"]))
+            if st.button("Bu kaydı sil", key=f"del_{r['id']}"):
+                delete_record(r["id"])
+                st.success("Silindi.")
+                st.experimental_rerun()
+
+def main_app():
+    st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="wide")
+    st.title(APP_TITLE)
+    st.caption(APP_FOOTER)
+
+    init_db()
+    if "visited" not in st.session_state:
+        increment_visit()
+        st.session_state["visited"] = True
+
+    # Auth
+    user = st.session_state.get("user")
+    if not user:
+        login_ui()
+        st.stop()
+
+    st.sidebar.write(f"👤 Kullanıcı: **{user['username']}** {'(Admin)' if user['is_admin'] else ''}")
+    if st.sidebar.button("Çıkış"):
+        st.session_state.pop("user", None)
+        st.experimental_rerun()
+
+    tabs = st.tabs(["Puan Hesaplayıcı", "Kayıtlarım", "Hakkında"] + (["Admin"] if user["is_admin"] else []))
+
+    with tabs[0]:
+        st.markdown("### 1) Yayın Bilgileri (Tez dışı)")
+        after_degree = st.checkbox("Bu yayınların tamamı uzmanlık/doktora SONRASI mı?", value=True)
+        articles = article_entry("Uluslararası/Ulusal Makaleler (Tez dışı)")
+
+        st.markdown("---")
+        st.markdown("### 2) Tezden Üretilmiş Yayınlar (Madde 3)")
+        thesis_articles = article_entry("Tez Yayınları", thesis=True)
+
+        st.markdown("---")
+        citations = citations_entry()
+        st.markdown("---")
+        superv = supervisions_entry()
+        st.markdown("---")
+        projects = projects_entry()
+        st.markdown("---")
+        meetings = meetings_entry()
+        st.markdown("---")
+        edu = education_entry()
+        st.markdown("---")
+        pat = patents_entry()
+        st.markdown("---")
+        aw = awards_entry()
+        st.markdown("---")
+        ed = editor_entry()
+        st.markdown("---")
+        oth = other_entry()
+
+        if st.button("Hesapla"):
+            payload = {
+                "after_degree": after_degree,
+                "articles": articles,
+                "thesis_articles": thesis_articles,
+                "citations": citations,
+                "supervisions": superv,
+                "projects": projects,
+                "meetings": meetings,
+                "education": edu,
+                "patents": pat,
+                "awards": aw,
+                "editor": ed,
+                "other": oth
+            }
+            totals = compute_points(payload)
+            st.subheader("💡 Sonuçlar")
+            st.metric("Toplam (Tüm Kalemler)", f"{totals.total:.2f}")
+            st.metric("Toplam (Tez yayınları hariç)", f"{totals.total_excluding_thesis:.2f}")
+            st.write("**Kontroller** (yeşil = sağlandı):")
+            for k, v in totals.checks.items():
+                st.write(f"- {'✅' if v else '❌'} {k}")
+            st.subheader("Döküm")
+            st.json(totals.breakdown)
+
+            if st.button("Kaydet"):
+                save_record(owner=user["username"], payload=payload, total=totals.total, breakdown=totals.breakdown)
+                st.success("Kayıt edildi.")
+
+    with tabs[1]:
+        st.markdown("### Kayıtlarım")
+        recs = list_records(owner=user["username"])
+        st.write(f"Toplam kendi kaydınız: {len(recs)}")
+        for r in recs:
+            with st.expander(f"#{r['id']} • {r['created_at']} • Toplam: {r['total']}"):
+                st.json(json.loads(r["payload"]))
+                st.json(json.loads(r["breakdown"]))
+                if st.button("Sil", key=f"mydel_{r['id']}"):
+                    delete_record(r["id"])
+                    st.success("Silindi.")
+                    st.experimental_rerun()
+        if recs:
+            js = [dict(r) for r in recs]
+            st.download_button("Kayıtları JSON indir", json.dumps(js, ensure_ascii=False, indent=2),
+                               file_name="kaydlarim.json")
+
+    with tabs[2]:
+        st.markdown("### Hakkında")
+        st.write("""
+Bu uygulama, 2025 Sağlık Bilimleri **Tablo 10** esas alınarak hazırlanmış bir puan hesaplayıcıdır.
+- 1–2: Uluslararası/Ulusal makaleler (tez dışı)
+- 3: Lisansüstü tezlerden üretilmiş yayınlar (max 20)
+- 5–13: Diğer kalemler (atıf, danışmanlık, proje, toplantı, eğitim-öğretim, patent, ödül, editörlük, diğer)
+**ÖNEMLİ:** Asgari koşullar ve “sonra/önce” ayrımları kullanıcının doğru veri girişi ile sağlanır.
+""")
+
+    if user["is_admin"] and len(tabs) >= 4:
+        with tabs[3]:
+            admin_panel()
+
+if __name__ == "__main__":
+    main_app()
+'''
+
+APP_PATH.write_text(code, encoding="utf-8")
+APP_PATH.as_posix()
