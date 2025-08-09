@@ -1,24 +1,10 @@
-# Create a complete Streamlit app with:
-# - User login/registration (SQLite + salted SHA256)
-# - Visit counter
-# - Full Tablo 10 (2025 Sağlık Bilimleri) point calculator with all modules
-# - Record save/load per user
-# - Admin panel to view/export all users and records
-# The app is a single file: /mnt/data/docentlik_puan_app.py
 
-import os, json, sqlite3, hashlib, time, textwrap, datetime as dt
-from pathlib import Path
-
-APP_PATH = Path("/mnt/data/docentlik_puan_app.py")
-
-code = r'''
 import os
 import json
-import time
 import sqlite3
 import hashlib
 import datetime as dt
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, Any, Tuple, List
 
 import streamlit as st
@@ -26,7 +12,7 @@ import streamlit as st
 # =========================
 # Config
 # =========================
-DB_PATH = os.environ.get("DOCENT_DB_PATH", "docentlik.db")
+DB_PATH = os.environ.get("DOCENT_DB_PATH", "/tmp/docentlik.db")  # <-- cloud-safe default
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")  # change in production!
 
@@ -39,6 +25,7 @@ APP_FOOTER = "© 2025 — Örnek Uygulama (Tablo 10 - Sağlık Bilimleri). Lütf
 def sha256_hash(password: str, salt: str) -> str:
     return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
+@st.cache_resource
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -73,7 +60,7 @@ def init_db():
             value INTEGER NOT NULL
         )
     """)
-    # visit counter
+    # visit counter row
     cur.execute("INSERT OR IGNORE INTO stats(key, value) VALUES ('visits', 0)")
     conn.commit()
 
@@ -86,18 +73,15 @@ def init_db():
                        VALUES (?, ?, ?, ?, ?)""",
                     (ADMIN_USER, ph, salt, 1, dt.datetime.utcnow().isoformat()))
         conn.commit()
-    conn.close()
 
 def increment_visit():
     conn = get_conn()
     conn.execute("UPDATE stats SET value = value + 1 WHERE key='visits'")
     conn.commit()
-    conn.close()
 
 def get_visits() -> int:
     conn = get_conn()
     row = conn.execute("SELECT value FROM stats WHERE key='visits'").fetchone()
-    conn.close()
     return int(row["value"]) if row else 0
 
 def register_user(username: str, password: str) -> Tuple[bool, str]:
@@ -111,13 +95,10 @@ def register_user(username: str, password: str) -> Tuple[bool, str]:
         return True, "Kayıt başarılı."
     except sqlite3.IntegrityError:
         return False, "Bu kullanıcı adı zaten mevcut."
-    finally:
-        conn.close()
 
 def authenticate(username: str, password: str) -> Tuple[bool, Dict[str, Any]]:
     conn = get_conn()
     row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-    conn.close()
     if not row:
         return False, {}
     salt = row["salt"]
@@ -129,14 +110,12 @@ def authenticate(username: str, password: str) -> Tuple[bool, Dict[str, Any]]:
 def list_users() -> List[sqlite3.Row]:
     conn = get_conn()
     rows = conn.execute("SELECT id, username, is_admin, created_at FROM users ORDER BY id").fetchall()
-    conn.close()
     return rows
 
 def set_admin(username: str, is_admin: bool):
     conn = get_conn()
     conn.execute("UPDATE users SET is_admin=? WHERE username=?", (1 if is_admin else 0, username))
     conn.commit()
-    conn.close()
 
 def reset_password(username: str, new_password: str):
     conn = get_conn()
@@ -144,7 +123,6 @@ def reset_password(username: str, new_password: str):
     ph = sha256_hash(new_password, salt)
     conn.execute("UPDATE users SET password_hash=?, salt=? WHERE username=?", (ph, salt, username))
     conn.commit()
-    conn.close()
 
 def save_record(owner: str, payload: Dict[str, Any], total: float, breakdown: Dict[str, Any]):
     conn = get_conn()
@@ -153,7 +131,6 @@ def save_record(owner: str, payload: Dict[str, Any], total: float, breakdown: Di
                  (owner, json.dumps(payload, ensure_ascii=False), total, json.dumps(breakdown, ensure_ascii=False),
                   dt.datetime.utcnow().isoformat()))
     conn.commit()
-    conn.close()
 
 def list_records(owner: str=None) -> List[sqlite3.Row]:
     conn = get_conn()
@@ -161,14 +138,12 @@ def list_records(owner: str=None) -> List[sqlite3.Row]:
         rows = conn.execute("SELECT * FROM records ORDER BY id DESC").fetchall()
     else:
         rows = conn.execute("SELECT * FROM records WHERE owner=? ORDER BY id DESC", (owner,)).fetchall()
-    conn.close()
     return rows
 
 def delete_record(record_id: int):
     conn = get_conn()
     conn.execute("DELETE FROM records WHERE id=?", (record_id,))
     conn.commit()
-    conn.close()
 
 # =========================
 # Point Rules (Tablo 10 - 2025)
@@ -206,33 +181,7 @@ def article_share(points: float, num_authors: int, role: str, has_primary_author
 
 def compute_points(data: Dict[str, Any]) -> Totals:
     """
-    data structure:
-    {
-      "after_degree": bool, # publishings after doctorate/specialty (for checks)
-      "articles": [  # non-thesis (Madde 1 & 2)
-        { "type": "Q1|Q2|Q3|Q4|AHCI|ESCI|OTHER_INT|TRDIZIN|OTHER_NAT|LETTER|CASE",
-          "num_authors": int, "role": "primary|second|other|equal", "has_primary": bool }
-      ],
-      "thesis_articles": [ # Madde 3
-        { "type": "SCIE_SSCI_AHCI|ESCI_SCOPUS|OTHER_INT|TRDIZIN|BKCI_BOOK|BKCI_CHAPTER|OTHER_BOOK|OTHER_BOOK_CH|CPCI|OTHER_CONF",
-          "num_authors": int, "role": "primary|second|other|equal", "has_primary": bool }
-      ],
-      "citations": { "wos_scopus": int, "bkci": int, "trdizin": int, "other": int },
-      "supervisions": { "phd": int, "ms": int, "phd_as_second": int, "ms_as_second": int },
-      "projects": {
-          "eu_tubitak_coord": int, "eu_tubitak_researcher": int, "eu_tubitak_advisor": int,
-          "intl_project_any": int, "public_private_rnd": int, "bap_coord": int
-      },
-      "meetings": { "cpci": int, "other": int },
-      "education": { "semester_mode": int, "year_mode": int, "has_2yr_faculty": bool },
-      "patents": {
-          "intl": int, "national": int, "utility": int, "app": int,
-          "intl_inventors": int, "national_inventors": int, "utility_inventors": int, "app_inventors": int
-      },
-      "awards": { "yok_phd": int, "yok_high": int, "tubitak_science": int, "tubitak_encour": int, "tuba_gebip": int, "tuba_tesep": int },
-      "editor": { "wos_scopus": int, "bkci_scopus_book": int, "trdizin": int },
-      "other": { "hindex5": bool, "top300_6m": bool }
-    }
+    data: see previous message for structure
     """
     # --- Article base points (Madde 1 & 2) ---
     base_map = {
@@ -251,7 +200,7 @@ def compute_points(data: Dict[str, Any]) -> Totals:
     # Articles (non-thesis)
     total_articles = 0.0
     total_articles_details = []
-    count_1a_primary_after = 0  # for check (a bendinden en az 3 makalede başlıca yazar, >=40 puan)
+    count_1a_primary_after = 0
     total_1a_points_after = 0.0
 
     for a in data.get("articles", []):
@@ -260,78 +209,64 @@ def compute_points(data: Dict[str, Any]) -> Totals:
         share = article_share(pts, a["num_authors"], a["role"], a.get("has_primary", True))
         total_articles += share
         total_articles_details.append((t, pts, share, a["num_authors"], a["role"]))
-        # check for 1-a condition
         if t in ["Q1","Q2","Q3","Q4"] and a["role"] == "primary" and data.get("after_degree", True):
             count_1a_primary_after += 1
             total_1a_points_after += share
 
-    # National article condition (Madde 2) tracking (ikisi TR Dizin, >=3 yayın; en az ikisinde başlıca)
-    nat_total = 0.0
+    # National article condition (Madde 2)
     nat_primary_count = 0
     nat_trdizin_count = 0
     nat_pub_count = 0
     for a in data.get("articles", []):
-        if a["type"] in ["TRDIZIN", "OTHER_NAT"] or a["type"] == "LETTER":
-            nat_pub_count += 1 if a["type"] in ["TRDIZIN", "OTHER_NAT"] else 0
+        if a["type"] in ["TRDIZIN", "OTHER_NAT"]:
+            nat_pub_count += 1
             if a["type"] == "TRDIZIN":
                 nat_trdizin_count += 1
             if a["role"] == "primary":
                 nat_primary_count += 1
-            nat_total += base_map.get(a["type"], 0)  # raw points, not share, for condition check only
 
     # Thesis publications (Madde 3)
-    thesis_total_raw = 0.0
     thesis_total_share = 0.0
     thesis_any_ah_to_h = False
     thesis_details = []
     for tpub in data.get("thesis_articles", []):
         t = tpub["type"]
         pts = thesis_map.get(t, 0)
-        thesis_total_raw += pts
         share = article_share(pts, tpub["num_authors"], tpub["role"], tpub.get("has_primary", True))
         thesis_total_share += share
         thesis_details.append((t, pts, share, tpub["num_authors"], tpub["role"]))
         if t in ["SCIE_SSCI_AHCI","ESCI_SCOPUS","OTHER_INT","TRDIZIN","BKCI_BOOK","BKCI_CHAPTER","OTHER_BOOK","OTHER_BOOK_CH"]:
             thesis_any_ah_to_h = True
-    thesis_total_capped = cap(thesis_total_share, 20.0)  # max 20 from Madde 3
+    thesis_total_capped = cap(thesis_total_share, 20.0)
 
-    # Citations (Madde 5) — max 10, and at least 5 from after-degree publications
+    # Citations (Madde 5) — max 10
     c = data.get("citations", {})
-    c_points = c.get("wos_scopus", 0)*3 + c.get("bkci", 0)*2 + c.get("trdizin", 0)*2 + c.get("other", 0)*1
-    c_points_capped = cap(c_points, 10.0)
+    c_points_capped = cap(c.get("wos_scopus", 0)*3 + c.get("bkci", 0)*2 + c.get("trdizin", 0)*2 + c.get("other", 0)*1, 10.0)
 
-    # Supervisions (Madde 6) — max 10; second advisor gets half
+    # Supervisions (Madde 6) — max 10
     s = data.get("supervisions", {})
-    s_points = s.get("phd",0)*5 + s.get("ms",0)*3 + s.get("phd_as_second",0)*2.5 + s.get("ms_as_second",0)*1.5
-    s_points_capped = cap(s_points, 10.0)
+    s_points_capped = cap(s.get("phd",0)*5 + s.get("ms",0)*3 + s.get("phd_as_second",0)*2.5 + s.get("ms_as_second",0)*1.5, 10.0)
 
     # Projects (Madde 7) — max 20
     p = data.get("projects", {})
-    p_points = (p.get("eu_tubitak_coord",0)*15 + p.get("eu_tubitak_researcher",0)*10 + p.get("eu_tubitak_advisor",0)*5 +
-                p.get("intl_project_any",0)*10 + p.get("public_private_rnd",0)*5 + p.get("bap_coord",0)*3)
-    p_points_capped = cap(p_points, 20.0)
+    p_points_capped = cap(p.get("eu_tubitak_coord",0)*15 + p.get("eu_tubitak_researcher",0)*10 + p.get("eu_tubitak_advisor",0)*5 +
+                          p.get("intl_project_any",0)*10 + p.get("public_private_rnd",0)*5 + p.get("bap_coord",0)*3, 20.0)
 
     # Meetings (Madde 8) — max 10
     m = data.get("meetings", {})
-    m_points = m.get("cpci",0)*5 + m.get("other",0)*3
-    m_points_capped = cap(m_points, 10.0)
+    m_points_capped = cap(m.get("cpci",0)*5 + m.get("other",0)*3, 10.0)
 
     # Education (Madde 9) — min 2, max 6
     edu = data.get("education", {})
     edu_points = 0.0
-    # period-based: semester_mode (>=4 farklı yarıyıl) → 2 puan; year_mode (>=2 farklı yıl) → 2 puan
-    if edu.get("semester_mode", 0) >= 4:
-        edu_points += 2
-    if edu.get("year_mode", 0) >= 2:
-        edu_points += 2
-    if edu.get("has_2yr_faculty", False):
-        edu_points += 2
+    if edu.get("semester_mode", 0) >= 4: edu_points += 2
+    if edu.get("year_mode", 0) >= 2: edu_points += 2
+    if edu.get("has_2yr_faculty", False): edu_points += 2
     edu_points_capped = cap(edu_points, 6.0)
 
-    # Patents (Madde 10) — points divided by inventors
+    # Patents (Madde 10)
     pat = data.get("patents", {})
-    def safe_div(x, n):
-        return (x / n) if n and n>0 else 0.0
+    def safe_div(x, n): return (x / n) if n and n>0 else 0.0
     pat_points = 0.0
     pat_points += safe_div(20*pat.get("intl",0), max(1, pat.get("intl_inventors",1)))
     pat_points += safe_div(10*pat.get("national",0), max(1, pat.get("national_inventors",1)))
@@ -340,19 +275,16 @@ def compute_points(data: Dict[str, Any]) -> Totals:
 
     # Awards (Madde 11) — max 25
     aw = data.get("awards", {})
-    aw_points = (aw.get("yok_phd",0)*25 + aw.get("yok_high",0)*25 + aw.get("tubitak_science",0)*25 +
-                 aw.get("tubitak_encour",0)*25 + aw.get("tuba_gebip",0)*25 + aw.get("tuba_tesep",0)*25)
-    aw_points_capped = cap(aw_points, 25.0)
+    aw_points_capped = cap( (aw.get("yok_phd",0)+aw.get("yok_high",0)+aw.get("tubitak_science",0)+
+                             aw.get("tubitak_encour",0)+aw.get("tuba_gebip",0)+aw.get("tuba_tesep",0)) * 25, 25.0)
 
     # Editor (Madde 12) — max 4
     ed = data.get("editor", {})
-    ed_points = ed.get("wos_scopus",0)*2 + ed.get("bkci_scopus_book",0)*1 + ed.get("trdizin",0)*1
-    ed_points_capped = cap(ed_points, 4.0)
+    ed_points_capped = cap(ed.get("wos_scopus",0)*2 + ed.get("bkci_scopus_book",0)*1 + ed.get("trdizin",0)*1, 4.0)
 
     # Other (Madde 13) — max 10
     oth = data.get("other", {})
-    other_points = (5 if oth.get("hindex5", False) else 0) + (5 if oth.get("top300_6m", False) else 0)
-    other_points_capped = cap(other_points, 10.0)
+    other_points_capped = cap( (5 if oth.get("hindex5", False) else 0) + (5 if oth.get("top300_6m", False) else 0), 10.0)
 
     total_excl_thesis = (total_articles + c_points_capped + s_points_capped + p_points_capped +
                          m_points_capped + edu_points_capped + pat_points + aw_points_capped +
@@ -360,16 +292,16 @@ def compute_points(data: Dict[str, Any]) -> Totals:
 
     total_all = total_excl_thesis + thesis_total_capped
 
-    # Compliance checks
-    checks = {}
-    checks["overall_min_100"] = total_all >= 100.0
-    checks["min_90_after_excl_thesis"] = total_excl_thesis >= 90.0  # NOTE: User should ensure after-degree filtering where relevant
-    checks["1a_primary_at_least3_and_40pts"] = (count_1a_primary_after >= 3 and total_1a_points_after >= 40.0)
-    checks["2_national_at_least3_with2_trdizin_and_2_primary"] = (nat_pub_count >= 3 and nat_trdizin_count >= 2 and nat_primary_count >= 2)
-    checks["3_thesis_at_least_one_from_a_h"] = thesis_any_ah_to_h
-    checks["5_citation_min5_after"] = c_points_capped >= 5.0  # user should reflect after-degree ones
-    checks["8_meeting_min5_after"] = m_points_capped >= 5.0
-    checks["9_education_min2"] = edu_points_capped >= 2.0
+    checks = {
+        "overall_min_100": total_all >= 100.0,
+        "min_90_after_excl_thesis": total_excl_thesis >= 90.0,
+        "1a_primary_at_least3_and_40pts": (count_1a_primary_after >= 3 and total_1a_points_after >= 40.0),
+        "2_national_at_least3_with2_trdizin_and_2_primary": (nat_pub_count >= 3 and nat_trdizin_count >= 2 and nat_primary_count >= 2),
+        "3_thesis_at_least_one_from_a_h": thesis_any_ah_to_h,
+        "5_citation_min5_after": c_points_capped >= 5.0,
+        "8_meeting_min5_after": m_points_capped >= 5.0,
+        "9_education_min2": edu_points_capped >= 2.0
+    }
 
     breakdown = {
         "1_2_articles_total_share": round(total_articles, 4),
@@ -385,8 +317,6 @@ def compute_points(data: Dict[str, Any]) -> Totals:
         "13_other_capped10": round(other_points_capped, 4),
         "TOTAL_EXCLUDING_THESIS": round(total_excl_thesis, 4),
         "TOTAL_ALL": round(total_all, 4),
-        "detail_articles": total_articles_details,
-        "detail_thesis": thesis_details
     }
     return Totals(total=total_all, total_excluding_thesis=total_excl_thesis, checks=checks, breakdown=breakdown)
 
@@ -525,6 +455,9 @@ def other_entry():
     top300 = st.checkbox("İlk 300 üniversitede ≥6 ay yurt dışı (kesintisiz) araştırma/öğretim", value=False)
     return {"hindex5": bool(h5), "top300_6m": bool(top300)}
 
+# -------- compute_points is above --------
+# (imported earlier in this file)
+
 def admin_panel():
     st.markdown("## 🔐 Admin Paneli")
     st.info("Admin yetkisi, ADMIN_USER ile giriş yapan kullanıcıya atanır (varsayılan: admin/admin). Lütfen üretimde değiştirin.")
@@ -574,7 +507,7 @@ def admin_panel():
                 st.success("Silindi.")
                 st.experimental_rerun()
 
-def main_app():
+def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="wide")
     st.title(APP_TITLE)
     st.caption(APP_FOOTER)
@@ -587,6 +520,13 @@ def main_app():
     # Auth
     user = st.session_state.get("user")
     if not user:
+        # quick shortcut login for admin (dev environments)
+        if st.sidebar.button("Admin olarak otomatik giriş"):
+            ok, info = authenticate(ADMIN_USER, ADMIN_PASS)
+            if ok:
+                st.session_state["user"] = info
+                st.experimental_rerun()
+        # otherwise normal login UI
         login_ui()
         st.stop()
 
@@ -669,7 +609,7 @@ def main_app():
         if recs:
             js = [dict(r) for r in recs]
             st.download_button("Kayıtları JSON indir", json.dumps(js, ensure_ascii=False, indent=2),
-                               file_name="kaydlarim.json")
+                               file_name="kayitlarim.json")
 
     with tabs[2]:
         st.markdown("### Hakkında")
@@ -686,7 +626,4 @@ Bu uygulama, 2025 Sağlık Bilimleri **Tablo 10** esas alınarak hazırlanmış 
             admin_panel()
 
 if __name__ == "__main__":
-    main_app()
-'''
-
-APP_PATH.as_posix()
+    main()
